@@ -5,11 +5,6 @@
 **/images/*
 **/sam_masks/*
 
-
-# Runtime output
-audit_results*.csv
-assignment.csv
-
 # Environment
 .venv/
 

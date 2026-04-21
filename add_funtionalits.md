@@ -1,2 +1,0 @@
-Is missing a buttom to return one image, suppose I miss click and I want to return to the previous image. I cant do that.
-Add a buttom to return to the previous image and also erase the attribution attached to the previous image. This way I can easily return to the previous image without having to refresh the page or lose my progress.
