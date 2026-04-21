@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QSizePolicy, QFrame, QMessageBox,
     QDialog, QLineEdit, QDialogButtonBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, QRect
 from PySide6.QtGui import QImage, QPixmap, QColor, QFont, QKeySequence, QShortcut
 
 
@@ -66,6 +66,18 @@ def load_bboxes(path: Path, img_w: int, img_h: int) -> list[tuple[int, int, int,
     except OSError:
         pass
     return boxes
+
+
+def erase_component(mask: np.ndarray, px: int, py: int) -> Optional[np.ndarray]:
+    """Zero out the connected component at (px, py). Returns None if pixel is already background."""
+    if not (0 <= py < mask.shape[0] and 0 <= px < mask.shape[1]):
+        return None
+    if mask[py, px] == 0:
+        return None
+    _, labels = cv2.connectedComponents(mask)
+    result = mask.copy()
+    result[labels == labels[py, px]] = 0
+    return result
 
 
 def compose_overlay(
@@ -123,17 +135,35 @@ def compose_overlay(
 # ─────────────────────────────────────────────────────────── widget ───────────
 
 class ScaledImageLabel(QLabel):
-    """QLabel that scales its pixmap to fit while preserving aspect ratio."""
+    """QLabel that scales its pixmap to fit while preserving aspect ratio.
+    In edit mode it captures left-clicks and emits image-space coordinates."""
+
+    # Emits (image_x, image_y) in the coordinate space of the full-resolution pixmap
+    image_clicked = Signal(int, int)
+
+    _STYLE_NORMAL = "background-color: #1a1a1a; border: 1px solid #3a3a3a;"
+    _STYLE_EDIT   = "background-color: #1a1a1a; border: 2px solid #ff9800;"
 
     def __init__(self, placeholder: str = "No image"):
         super().__init__()
         self._pixmap: Optional[QPixmap] = None
         self._placeholder = placeholder
+        self._edit_mode = False
+        self._render_rect = QRect()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(280, 200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("background-color: #1a1a1a; border: 1px solid #3a3a3a;")
+        self.setStyleSheet(self._STYLE_NORMAL)
         self.setText(self._placeholder)
+
+    def set_edit_mode(self, active: bool):
+        self._edit_mode = active
+        if active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.setStyleSheet(self._STYLE_EDIT)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setStyleSheet(self._STYLE_NORMAL)
 
     def set_image(self, pixmap: Optional[QPixmap]):
         self._pixmap = pixmap
@@ -152,6 +182,24 @@ class ScaledImageLabel(QLabel):
                 Qt.TransformationMode.SmoothTransformation,
             )
             super().setPixmap(scaled)
+            x_off = (self.width()  - scaled.width())  // 2
+            y_off = (self.height() - scaled.height()) // 2
+            self._render_rect = QRect(x_off, y_off, scaled.width(), scaled.height())
+
+    def mousePressEvent(self, event):
+        if (self._edit_mode
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._pixmap and not self._pixmap.isNull()
+                and self._render_rect.width() > 0):
+            r = self._render_rect
+            cx = event.position().x() - r.x()
+            cy = event.position().y() - r.y()
+            if 0 <= cx < r.width() and 0 <= cy < r.height():
+                img_x = int(cx / r.width()  * self._pixmap.width())
+                img_y = int(cy / r.height() * self._pixmap.height())
+                self.image_clicked.emit(img_x, img_y)
+                return
+        super().mousePressEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -269,6 +317,10 @@ class SelectUserDialog(QDialog):
 
 # ────────────────────────────────────────────────────────── data layer ────────
 
+# Terminal decisions — anything not in this set is still pending
+_FINALIZED = {"segmentation", "segmentation_original", "segmentation_cleaned", "nothing", "detection"}
+
+
 class Dataset:
     def __init__(self, root: str, user: str):
         self.root = Path(root)
@@ -284,7 +336,7 @@ class Dataset:
 
         self.decisions: dict[str, str] = self._load_csv()
 
-        finalized = {k for k, v in self.decisions.items() if v in ("segmentation", "nothing", "detection")}
+        finalized = {k for k, v in self.decisions.items() if v in _FINALIZED}
         return_later = [img for img in self.all_images if self.decisions.get(img) == "return_later"]
         pending = [img for img in self.all_images if img not in finalized and img not in return_later]
 
@@ -348,7 +400,7 @@ class Dataset:
                 try:
                     with open(csv_path, newline="") as fh:
                         for row in csv.DictReader(fh):
-                            if row.get("decision") in ("segmentation", "nothing", "detection"):
+                            if row.get("decision") in _FINALIZED:
                                 done_counts[user] = done_counts.get(user, 0) + 1
                 except Exception:
                     pass
@@ -418,8 +470,14 @@ class Dataset:
 
     @property
     def progress(self) -> tuple[int, int]:
-        done = sum(1 for v in self.decisions.values() if v in ("segmentation", "nothing", "detection"))
+        done = sum(1 for v in self.decisions.values() if v in _FINALIZED)
         return done, len(self.all_images)
+
+    def save_cleaned_mask(self, image_name: str, mask: np.ndarray):
+        folder = self.root / "sam_masks_cleaned"
+        folder.mkdir(exist_ok=True)
+        stem = Path(image_name).stem
+        cv2.imwrite(str(folder / f"{stem}.png"), mask)
 
     # ── path resolution ───────────────────────────────────────────────────────
 
@@ -498,6 +556,11 @@ class MainWindow(QMainWindow):
         self.gt_color  = QColor("#00e676")   # bright green
         self.sam_color = QColor("#ff5252")   # bright red
         self.opacity   = 0.45
+
+        # Edit-mode state (reset per image, mode toggle is sticky)
+        self._edit_mode: bool = False
+        self._sam_mask_edited: Optional[np.ndarray] = None
+        self._mask_was_edited: bool = False
 
         self._build_ui()
 
@@ -632,6 +695,7 @@ class MainWindow(QMainWindow):
 
         orig_w, self._orig_panel = _panel("Original")
         ann_w,  self._ann_panel  = _panel("Annotated  (GT + SAM3 overlay)")
+        self._ann_panel.image_clicked.connect(self._on_mask_click)
         lay.addWidget(orig_w)
         lay.addWidget(ann_w)
         return w
@@ -658,6 +722,17 @@ class MainWindow(QMainWindow):
         self._opacity_lbl = QLabel(f"{int(self.opacity * 100)}%")
         self._opacity_lbl.setFixedWidth(36)
 
+        self._edit_btn = QPushButton("✏  Edit Mask")
+        self._edit_btn.setCheckable(True)
+        self._edit_btn.setFixedHeight(30)
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.toggled.connect(self._toggle_edit_mode)
+
+        self._reset_btn = QPushButton("↺  Reset")
+        self._reset_btn.setFixedHeight(30)
+        self._reset_btn.setEnabled(False)
+        self._reset_btn.clicked.connect(self._reset_edit_state)
+
         lay.addWidget(QLabel("GT color:"))
         lay.addWidget(self._gt_btn)
         lay.addSpacing(16)
@@ -668,6 +743,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._opacity_slider)
         lay.addWidget(self._opacity_lbl)
         lay.addStretch()
+        lay.addWidget(self._edit_btn)
+        lay.addSpacing(6)
+        lay.addWidget(self._reset_btn)
         return w
 
     def _build_shortcuts_row(self) -> QWidget:
@@ -806,6 +884,15 @@ class MainWindow(QMainWindow):
             self._bboxes = []
         self._sam_mask = _read(p["sam_mask"], cv2.IMREAD_GRAYSCALE)
 
+        # Reset per-image edit state; keep _edit_mode sticky
+        self._sam_mask_edited = None
+        self._mask_was_edited = False
+        self._reset_btn.setEnabled(False)
+        has_sam = self._sam_mask is not None
+        self._edit_btn.setEnabled(has_sam)
+        if not has_sam and self._edit_mode:
+            self._edit_btn.setChecked(False)  # will trigger _toggle_edit_mode(False)
+
         if self._orig_img is None:
             self._orig_panel.set_image(None)
             self._ann_panel.set_image(None)
@@ -819,11 +906,12 @@ class MainWindow(QMainWindow):
     def _redraw_annotated(self):
         if self._orig_img is None:
             return
+        active_mask = self._sam_mask_edited if self._sam_mask_edited is not None else self._sam_mask
         annotated = compose_overlay(
             self._orig_img,
             self._gt_mask,
             self._bboxes,
-            self._sam_mask,
+            active_mask,
             self._qcolor_to_bgr(self.gt_color),
             self._qcolor_to_bgr(self.sam_color),
             self.opacity,
@@ -851,10 +939,51 @@ class MainWindow(QMainWindow):
         self._prog_bar.setValue(pct)
         self._pct_label.setText(f"{pct}%")
 
+    # ── edit-mode methods ─────────────────────────────────────────────────────
+
+    def _toggle_edit_mode(self, active: bool):
+        self._edit_mode = active
+        self._ann_panel.set_edit_mode(active)
+        self._edit_btn.setText("✏  Editing…" if active else "✏  Edit Mask")
+
+    def _on_mask_click(self, img_x: int, img_y: int):
+        if self._orig_img is None:
+            return
+        working = self._sam_mask_edited if self._sam_mask_edited is not None else self._sam_mask
+        if working is None:
+            return
+        # Map image-display coords → mask coords (mask may have different resolution)
+        mh, mw = working.shape[:2]
+        ih, iw = self._orig_img.shape[:2]
+        mx = int(img_x / iw * mw)
+        my = int(img_y / ih * mh)
+        result = erase_component(working, mx, my)
+        if result is None:
+            return  # clicked on background
+        self._sam_mask_edited = result
+        self._mask_was_edited = True
+        self._reset_btn.setEnabled(True)
+        self._redraw_annotated()
+
+    def _reset_edit_state(self, *, keep_mode: bool = False):
+        self._sam_mask_edited = None
+        self._mask_was_edited = False
+        self._reset_btn.setEnabled(False)
+        if not keep_mode:
+            pass  # mode stays sticky — user controls it via the toggle
+        self._redraw_annotated()
+
     # ── keyboard commands ─────────────────────────────────────────────────────
 
     def _cmd_segmentation(self):
-        if self.dataset and self.dataset.decide("segmentation"):
+        if not self.dataset:
+            return
+        if self._mask_was_edited and self._sam_mask_edited is not None:
+            self.dataset.save_cleaned_mask(self.dataset.current, self._sam_mask_edited)
+            verdict = "segmentation_cleaned"
+        else:
+            verdict = "segmentation_original"
+        if self.dataset.decide(verdict):
             self._advance()
 
     def _cmd_nothing(self):

@@ -1,0 +1,5 @@
+During the auditing process, I noticed some issues with the SAM3 masks. In several cases, regions that are not potholes are incorrectly labeled as potholes. This happens because the model struggles to distinguish between actual potholes and similar visual patterns, such as shadows or debris.
+
+Do you think it would be possible to add a new feature to the app that allows users to manually refine the masks? The idea would be to include an “erase” tool, where the user can select unwanted white regions directly on the image and remove them from the mask. Ideally, it should behave similarly to the eraser tool in Paint, where touching a region removes that connected component entirely.
+
+This would require some adjustments to the pipeline. If, after manual editing, the image is approved for segmentation, the system should save the cleaned mask in a new folder (e.g., sam_masks_cleaned). Additionally, in the .csv file, the decision column should distinguish between original and edited masks by using labels such as segmentation_original and segmentation_cleaned.

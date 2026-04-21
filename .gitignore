@@ -4,6 +4,13 @@
 **/bboxes/*
 **/images/*
 **/sam_masks/*
+**/sam_masks_cleaned/*
+
+!**/.gitkeep
+
+# Runtime output
+audit_results*.csv
+assignment.csv
 
 # Environment
 .venv/
