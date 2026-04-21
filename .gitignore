@@ -1,0 +1,17 @@
+# Dataset content — ignore files inside these folders at any depth,
+# but keep the folders themselves via .gitkeep
+**/bbox/*
+**/bboxes/*
+**/images/*
+**/sam_masks/*
+
+
+# Runtime output
+audit_results*.csv
+assignment.csv
+
+# Environment
+.venv/
+
+# OS
+.DS_Store
