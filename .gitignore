@@ -9,8 +9,7 @@
 !**/.gitkeep
 
 # Runtime output
-audit_results*.csv
-assignment.csv
+
 
 # Environment
 .venv/
