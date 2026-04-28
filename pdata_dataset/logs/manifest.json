@@ -1,0 +1,11 @@
+{
+  "dataset": "pdata_dataset",
+  "dry_run": false,
+  "n_processed": 1000,
+  "sam3_success_this_run": 994,
+  "sam3_failures_this_run": [
+    "20250305_134806_color_png.rf.31475042500453da02b00401dcab3dc4"
+  ],
+  "drive_output": "/content/drive/MyDrive/datasets/pdata_dataset",
+  "timestamp": "2026-04-27T16:46:43.679875Z"
+}

@@ -1,0 +1,1 @@
+DO not LOAD the entire datase, read only an initial portion of the dataset, to you understand the structure of the data and to identify any potential issues or patterns.

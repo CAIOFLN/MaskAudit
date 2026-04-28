@@ -5,6 +5,8 @@
 **/images/*
 **/sam_masks/*
 **/sam_masks_cleaned/*
+**/bboxes_generated/*
+**/original_masks/*
 
 !**/.gitkeep
 
