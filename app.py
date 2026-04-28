@@ -318,7 +318,11 @@ class SelectUserDialog(QDialog):
 # ────────────────────────────────────────────────────────── data layer ────────
 
 # Terminal decisions — anything not in this set is still pending
-_FINALIZED = {"segmentation", "segmentation_original", "segmentation_cleaned", "nothing", "detection"}
+_FINALIZED = {
+    "segmentation", "segmentation_original", "segmentation_cleaned",
+    "nothing", "detection",
+    "original_mask", "SAM3_mask", "SAM3_mask_cleaned",
+}
 
 
 class Dataset:
@@ -481,6 +485,10 @@ class Dataset:
 
     # ── path resolution ───────────────────────────────────────────────────────
 
+    @property
+    def has_original_masks(self) -> bool:
+        return (self.root / "original_masks").exists()
+
     def get_paths(self, name: str) -> dict[str, Optional[Path]]:
         stem = Path(name).stem
         paths: dict[str, Optional[Path]] = {
@@ -488,13 +496,15 @@ class Dataset:
             "mask": None,
             "bbox": None,
             "sam_mask": None,
+            "original_mask": None,
         }
         lookups = [
-            ("masks",      "mask",     [f"{stem}_mask.png",     f"{stem}.png",     f"{stem}_mask.jpg"]),
-            ("bbox",       "bbox",     [f"{stem}.txt",          f"{stem}_bbox.txt"]),
-            ("bboxes",     "bbox",     [f"{stem}_bbox.txt",     f"{stem}.txt"]),
-            ("sam_masks",  "sam_mask", [f"{stem}_SAM3.png",     f"{stem}_sam_mask.png", f"{stem}.png", f"{stem}_sam_mask.jpg"]),
-            ("sam3_masks", "sam_mask", [f"{stem}_SAM3.png",     f"{stem}_sam_mask.png", f"{stem}.png", f"{stem}_sam_mask.jpg"]),
+            ("masks",          "mask",          [f"{stem}_mask.png",     f"{stem}.png",     f"{stem}_mask.jpg"]),
+            ("bbox",           "bbox",          [f"{stem}.txt",          f"{stem}_bbox.txt"]),
+            ("bboxes",         "bbox",          [f"{stem}_bbox.txt",     f"{stem}.txt"]),
+            ("sam_masks",      "sam_mask",      [f"{stem}_SAM3.png",     f"{stem}_sam_mask.png", f"{stem}.png", f"{stem}_sam_mask.jpg"]),
+            ("sam3_masks",     "sam_mask",      [f"{stem}_SAM3.png",     f"{stem}_sam_mask.png", f"{stem}.png", f"{stem}_sam_mask.jpg"]),
+            ("original_masks", "original_mask", [f"{stem}.png",          f"{stem}.jpg",     f"{stem}_mask.png"]),
         ]
         for folder, key, variants in lookups:
             if paths[key] is not None:   # already found by a previous rule
@@ -547,10 +557,14 @@ class MainWindow(QMainWindow):
         self.dataset: Optional[Dataset] = None
 
         # Currently loaded image data
-        self._orig_img:  Optional[np.ndarray] = None
-        self._gt_mask:   Optional[np.ndarray] = None
-        self._bboxes:    list[tuple[int, int, int, int]] = []
-        self._sam_mask:  Optional[np.ndarray] = None
+        self._orig_img:       Optional[np.ndarray] = None
+        self._gt_mask:        Optional[np.ndarray] = None
+        self._bboxes:         list[tuple[int, int, int, int]] = []
+        self._sam_mask:       Optional[np.ndarray] = None
+        self._original_mask:  Optional[np.ndarray] = None
+
+        # Mode flag: True when the dataset has an original_masks/ folder
+        self._has_orig_masks: bool = False
 
         # Overlay configuration
         self.gt_color  = QColor("#00e676")   # bright green
@@ -680,7 +694,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(12)
 
-        def _panel(title: str) -> tuple[QWidget, ScaledImageLabel]:
+        def _panel(title: str) -> tuple[QWidget, ScaledImageLabel, QLabel]:
             container = QWidget()
             vl = QVBoxLayout(container)
             vl.setContentsMargins(0, 0, 0, 0)
@@ -691,10 +705,10 @@ class MainWindow(QMainWindow):
             img_lbl = ScaledImageLabel("No image")
             vl.addWidget(lbl)
             vl.addWidget(img_lbl)
-            return container, img_lbl
+            return container, img_lbl, lbl
 
-        orig_w, self._orig_panel = _panel("Original")
-        ann_w,  self._ann_panel  = _panel("Annotated  (GT + SAM3 overlay)")
+        orig_w, self._orig_panel, self._orig_title = _panel("Original")
+        ann_w,  self._ann_panel,  self._ann_title  = _panel("Annotated  (GT + SAM3 overlay)")
         self._ann_panel.image_clicked.connect(self._on_mask_click)
         lay.addWidget(orig_w)
         lay.addWidget(ann_w)
@@ -748,13 +762,17 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._reset_btn)
         return w
 
+    _SHORTCUTS_NORMAL = "↑  Segmentation      ↓  Trash      →  Detection      ←  Return later      ⌫  Undo"
+    _SHORTCUTS_ORIG   = "↑  SAM3 mask      ↓  Delete      →  Original mask      ←  Return later      ⌫  Undo"
+
     def _build_shortcuts_row(self) -> QWidget:
         w = QWidget()
         w.setFixedHeight(34)
         lay = QHBoxLayout(w)
         lay.setContentsMargins(14, 0, 14, 0)
-        lbl = QLabel("↑  Segmentation      ↓  Trash      →  Detection      ←  Return later      ⌫  Undo")
+        lbl = QLabel(self._SHORTCUTS_NORMAL)
         lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        self._shortcuts_lbl = lbl
 
         self._undo_btn = QPushButton("↩  Undo")
         self._undo_btn.setFixedSize(80, 24)
@@ -851,6 +869,7 @@ class MainWindow(QMainWindow):
             return
 
         self.dataset = ds
+        self._has_orig_masks = ds.has_original_masks
         self._ds_label.setText(path)
         self._ds_label.setStyleSheet(f"color: {_TEXT};")
         self._user_label.setText(f"  {user}")
@@ -875,14 +894,25 @@ class MainWindow(QMainWindow):
         def _read(path: Optional[Path], flags=cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
             return cv2.imread(str(path), flags) if path and path.exists() else None
 
-        self._orig_img = _read(p["image"])
-        self._gt_mask  = _read(p["mask"],     cv2.IMREAD_GRAYSCALE)
-        if p["bbox"] and self._orig_img is not None:
+        self._orig_img       = _read(p["image"])
+        self._gt_mask        = _read(p["mask"],          cv2.IMREAD_GRAYSCALE)
+        self._original_mask  = _read(p["original_mask"], cv2.IMREAD_GRAYSCALE)
+        if p["bbox"] and self._orig_img is not None and not self._has_orig_masks:
             h, w = self._orig_img.shape[:2]
             self._bboxes = load_bboxes(p["bbox"], w, h)
         else:
             self._bboxes = []
         self._sam_mask = _read(p["sam_mask"], cv2.IMREAD_GRAYSCALE)
+
+        # Update panel labels based on mode
+        if self._has_orig_masks:
+            self._orig_title.setText("Original mask")
+            self._ann_title.setText("SAM3 mask  (editable)")
+            self._shortcuts_lbl.setText(self._SHORTCUTS_ORIG)
+        else:
+            self._orig_title.setText("Original")
+            self._ann_title.setText("Annotated  (GT + SAM3 overlay)")
+            self._shortcuts_lbl.setText(self._SHORTCUTS_NORMAL)
 
         # Reset per-image edit state; keep _edit_mode sticky
         self._sam_mask_edited = None
@@ -897,7 +927,6 @@ class MainWindow(QMainWindow):
             self._orig_panel.set_image(None)
             self._ann_panel.set_image(None)
         else:
-            self._orig_panel.set_image(bgr_to_pixmap(self._orig_img))
             self._redraw_annotated()
 
         self._img_name_label.setText(name)
@@ -906,17 +935,35 @@ class MainWindow(QMainWindow):
     def _redraw_annotated(self):
         if self._orig_img is None:
             return
-        active_mask = self._sam_mask_edited if self._sam_mask_edited is not None else self._sam_mask
-        annotated = compose_overlay(
-            self._orig_img,
-            self._gt_mask,
-            self._bboxes,
-            active_mask,
-            self._qcolor_to_bgr(self.gt_color),
-            self._qcolor_to_bgr(self.sam_color),
-            self.opacity,
-        )
-        self._ann_panel.set_image(bgr_to_pixmap(annotated))
+        active_sam = self._sam_mask_edited if self._sam_mask_edited is not None else self._sam_mask
+        gt_bgr  = self._qcolor_to_bgr(self.gt_color)
+        sam_bgr = self._qcolor_to_bgr(self.sam_color)
+
+        if self._has_orig_masks:
+            # Left panel: original image + original mask overlay
+            left = compose_overlay(
+                self._orig_img, self._original_mask, [], None,
+                gt_bgr, sam_bgr, self.opacity,
+            )
+            self._orig_panel.set_image(bgr_to_pixmap(left))
+            # Right panel: original image + SAM3 mask overlay (editable)
+            right = compose_overlay(
+                self._orig_img, None, [], active_sam,
+                gt_bgr, sam_bgr, self.opacity,
+            )
+            self._ann_panel.set_image(bgr_to_pixmap(right))
+        else:
+            self._orig_panel.set_image(bgr_to_pixmap(self._orig_img))
+            annotated = compose_overlay(
+                self._orig_img,
+                self._gt_mask,
+                self._bboxes,
+                active_sam,
+                gt_bgr,
+                sam_bgr,
+                self.opacity,
+            )
+            self._ann_panel.set_image(bgr_to_pixmap(annotated))
 
     def _show_done(self):
         self._orig_img = None
@@ -978,11 +1025,19 @@ class MainWindow(QMainWindow):
     def _cmd_segmentation(self):
         if not self.dataset:
             return
-        if self._mask_was_edited and self._sam_mask_edited is not None:
-            self.dataset.save_cleaned_mask(self.dataset.current, self._sam_mask_edited)
-            verdict = "segmentation_cleaned"
+        edited = self._mask_was_edited and self._sam_mask_edited is not None
+        if self._has_orig_masks:
+            if edited:
+                self.dataset.save_cleaned_mask(self.dataset.current, self._sam_mask_edited)
+                verdict = "SAM3_mask_cleaned"
+            else:
+                verdict = "SAM3_mask"
         else:
-            verdict = "segmentation_original"
+            if edited:
+                self.dataset.save_cleaned_mask(self.dataset.current, self._sam_mask_edited)
+                verdict = "segmentation_cleaned"
+            else:
+                verdict = "segmentation_original"
         if self.dataset.decide(verdict):
             self._advance()
 
@@ -991,7 +1046,10 @@ class MainWindow(QMainWindow):
             self._advance()
 
     def _cmd_detection(self):
-        if self.dataset and self.dataset.decide("detection"):
+        if not self.dataset:
+            return
+        verdict = "original_mask" if self._has_orig_masks else "detection"
+        if self.dataset.decide(verdict):
             self._advance()
 
     def _cmd_return_later(self):
